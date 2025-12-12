@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import aiosqlite
 import gspread
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -25,13 +26,15 @@ from google.oauth2.service_account import Credentials
 # -----------------------------
 # Конфиг
 # -----------------------------
-load_dotenv()
+load_dotenv()  # подхватит .env в WorkingDirectory; в systemd ещё лучше через EnvironmentFile
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
 CREDS_PATH = os.getenv("GOOGLE_CREDS_PATH", "").strip()
 ADMIN_IDS = set(
-    int(x.strip()) for x in (os.getenv("ADMIN_IDS", "") or "").split(",") if x.strip().isdigit()
+    int(x.strip())
+    for x in (os.getenv("ADMIN_IDS", "") or "").split(",")
+    if x.strip().isdigit()
 )
 
 DB_PATH = "bot.db"
@@ -377,30 +380,24 @@ async def cancel(message: Message, state: FSMContext):
 
 async def start_form(message: Message, state: FSMContext, form_key: str):
     await state.set_state(Flow.filling_form)
-    await state.update_data(
-        form_key=form_key,
-        idx=0,
-        answers={},
-    )
+    await state.update_data(form_key=form_key, idx=0, answers={})
 
-    # Скрываем меню-клавиатуру на время анкеты (в т.ч. для вопросов Да/Нет — без кнопок)
+    # меню скрываем на время анкеты (в т.ч. Да/Нет — без кнопок)
     title, _ = FORMS[form_key]
     await message.answer(f"{title}\n\nОтвечайте сообщениями.", reply_markup=ReplyKeyboardRemove())
-    await ask_next_question(message, state)
+    await ask_question_by_index(message, state)
 
 
-async def ask_next_question(message: Message, state: FSMContext):
+async def ask_question_by_index(message: Message, state: FSMContext):
     data = await state.get_data()
     form_key = data["form_key"]
     idx = data["idx"]
     _, questions = FORMS[form_key]
 
     if idx >= len(questions):
-        await finish_form(message, state)
         return
 
-    q = questions[idx]
-    await message.answer(q, reply_markup=ReplyKeyboardRemove())
+    await message.answer(questions[idx], reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(F.text == "Родительская анкета")
@@ -424,42 +421,44 @@ async def menu_child_short(message: Message, state: FSMContext):
 
 
 @router.message(Flow.filling_form)
-async def form_answer(message: Message, state: FSMContext):
+async def form_answer(message: Message, state: FSMContext, sheets: SheetsClient):
     data = await state.get_data()
     form_key = data["form_key"]
     idx = data["idx"]
     answers: Dict[str, str] = data["answers"]
 
     _, questions = FORMS[form_key]
+
     if idx < len(questions):
         question = questions[idx]
         answers[question] = (message.text or "").strip()
 
-    await state.update_data(idx=idx + 1, answers=answers)
-    await ask_next_question(message, state)
+    new_idx = idx + 1
+
+    # если анкета закончилась — сохраняем и возвращаем меню
+    if new_idx >= len(questions):
+        await state.update_data(idx=new_idx, answers=answers)
+        await finish_form(message, state, sheets)
+        return
+
+    # иначе идём дальше
+    await state.update_data(idx=new_idx, answers=answers)
+    await ask_question_by_index(message, state)
 
 
-async def finish_form(message: Message, state: FSMContext):
+async def finish_form(message: Message, state: FSMContext, sheets: SheetsClient):
     data = await state.get_data()
     form_key = data["form_key"]
     form_title, _ = FORMS[form_key]
     answers: Dict[str, str] = data["answers"]
 
-    # метаданные
     row: Dict[str, str] = {}
     row["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
     row["telegram_user_id"] = str(message.from_user.id)
     row["telegram_username"] = message.from_user.username or ""
-
-    # ответы
     row.update(answers)
 
-    # запись в гугл-таблицу
     headers = make_headers(form_key)
-
-    # sheets_client хранится в dp["sheets"]
-    sheets: SheetsClient = message.bot["sheets"]  # type: ignore
-
     await asyncio.to_thread(sheets.append_row, form_title, headers, row)
 
     await state.clear()
@@ -494,9 +493,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
     user_ids = await all_user_ids()
 
     text = (message.caption or message.text or "").strip()
-    photo_id = None
-    if message.photo:
-        photo_id = message.photo[-1].file_id
+    photo_id = message.photo[-1].file_id if message.photo else None
 
     sent = 0
     failed = 0
@@ -507,11 +504,10 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
                 await bot.send_photo(chat_id=uid, photo=photo_id, caption=text or None)
             else:
                 if not text:
-                    # Нечего отправлять
                     continue
                 await bot.send_message(chat_id=uid, text=text)
             sent += 1
-            await asyncio.sleep(0.035)  # мягкая защита от лимитов
+            await asyncio.sleep(0.035)
         except Exception:
             failed += 1
 
@@ -522,18 +518,18 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
 # -----------------------------
 # Startup
 # -----------------------------
-async def on_startup(bot: Bot):
+async def on_startup(dispatcher: Dispatcher, bot: Bot):
     await init_db()
 
     sheets = SheetsClient(sheets_id=SHEETS_ID, creds_path=CREDS_PATH)
     sheets.connect()
 
-    # создаём/проверяем вкладки и заголовки
     for form_key, (title, _) in FORMS.items():
         headers = make_headers(form_key)
         await asyncio.to_thread(sheets.ensure_worksheet, title, headers)
 
-    bot["sheets"] = sheets
+    # ВАЖНО: сохраняем в workflow_data, чтобы aiogram мог инжектить в хендлеры параметр sheets: SheetsClient
+    dispatcher.workflow_data["sheets"] = sheets
 
 
 async def main():
@@ -544,7 +540,7 @@ async def main():
     if not CREDS_PATH:
         raise RuntimeError("GOOGLE_CREDS_PATH is empty")
 
-    bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.include_router(router)
