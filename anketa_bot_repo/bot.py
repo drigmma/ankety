@@ -185,14 +185,26 @@ FORMS: Dict[str, Tuple[str, List[str]]] = {
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Родительская анкета")],
-            [KeyboardButton(text="Сокращенная родительская")],
-            [KeyboardButton(text="Детская анкета")],
-            [KeyboardButton(text="Сокращенная детская")],
+            [KeyboardButton(text="📋 Родительская анкета")],
+            [KeyboardButton(text="📝 Сокращенная родительская")],
+            [KeyboardButton(text="👦 Детская анкета")],
+            [KeyboardButton(text="✏️ Сокращенная детская")],
+            [KeyboardButton(text="ℹ️ Помощь")],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
-        input_field_placeholder="Выберите анкету",
+        input_field_placeholder="Выберите действие",
+    )
+
+
+def policy_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Да, согласен")],
+            [KeyboardButton(text="❌ Нет, не согласен")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
 
@@ -322,12 +334,12 @@ async def all_user_ids() -> List[int]:
 # -----------------------------
 def is_yes(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"да", "yes", "y", "ага", "ок", "okay", "окей", "согласен", "согласна"}
+    return t in {"да", "yes", "y", "ага", "ок", "okay", "окей", "согласен", "согласна", "✅ да, согласен"}
 
 
 def is_no(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"нет", "no", "n", "не согласен", "не согласна"}
+    return t in {"нет", "no", "n", "не согласен", "не согласна", "❌ нет, не согласен"}
 
 
 def meta_headers() -> List[str]:
@@ -355,14 +367,42 @@ async def cmd_start(message: Message, state: FSMContext):
     if not accepted:
         await state.set_state(Flow.waiting_policy)
         await message.answer(
-            "Согласны ли вы с нашей политикой обработки персональных данных?\n"
-            "Ответьте: Да или Нет",
-            reply_markup=ReplyKeyboardRemove(),
+            "🏕 <b>Добро пожаловать в бот лагеря!</b>\n\n"
+            "📄 Для продолжения работы необходимо согласиться с политикой обработки персональных данных.\n\n"
+            "Согласны ли вы с нашей политикой обработки персональных данных?",
+            reply_markup=policy_kb(),
         )
         return
 
     await state.clear()
-    await message.answer("Выберите анкету:", reply_markup=main_menu_kb())
+    await message.answer(
+        f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
+        "📋 Выберите нужную анкету из меню ниже:",
+        reply_markup=main_menu_kb()
+    )
+
+
+@router.message(Command("help"))
+@router.message(F.text == "ℹ️ Помощь")
+async def cmd_help(message: Message):
+    help_text = (
+        "ℹ️ <b>Доступные команды:</b>\n\n"
+        "/start - Запустить бота и показать главное меню\n"
+        "/cancel - Отменить заполнение анкеты\n"
+        "/help - Показать эту справку\n\n"
+        "📋 <b>Доступные анкеты:</b>\n\n"
+        "• Родительская анкета (полная) - 50 вопросов\n"
+        "• Сокращенная родительская - 21 вопрос\n"
+        "• Детская анкета (полная) - 23 вопроса\n"
+        "• Сокращенная детская - 8 вопросов\n\n"
+        "💡 <b>Как заполнить анкету:</b>\n"
+        "1. Выберите нужную анкету из меню\n"
+        "2. Отвечайте на вопросы по очереди\n"
+        "3. Если нужно отменить - используйте /cancel\n"
+        "4. После завершения данные сохранятся в Google Sheets\n\n"
+        "❓ Если возникли вопросы - обратитесь к администратору."
+    )
+    await message.answer(help_text, reply_markup=main_menu_kb())
 
 
 @router.message(Flow.waiting_policy)
@@ -373,34 +413,72 @@ async def policy_answer(message: Message, state: FSMContext):
     if is_yes(message.text):
         await set_policy(user.id, True)
         await state.clear()
-        await message.answer("Спасибо! Теперь можно продолжить.", reply_markup=main_menu_kb())
+        await message.answer(
+            "✅ <b>Спасибо за согласие!</b>\n\n"
+            "Теперь вы можете заполнять анкеты. Выберите нужную из меню:",
+            reply_markup=main_menu_kb()
+        )
         return
 
     if is_no(message.text):
         await set_policy(user.id, False)
         await state.set_state(Flow.waiting_policy)
         await message.answer(
-            "Без согласия продолжить работу с ботом нельзя.\n"
-            "Если передумаете — напишите: Да",
-            reply_markup=ReplyKeyboardRemove(),
+            "❌ <b>Без согласия продолжить работу невозможно.</b>\n\n"
+            "Если передумаете — нажмите кнопку <b>«Да, согласен»</b> или отправьте команду /start",
+            reply_markup=policy_kb()
         )
         return
 
-    await message.answer("Пожалуйста, ответьте только: Да или Нет", reply_markup=ReplyKeyboardRemove())
+    await message.answer(
+        "⚠️ Пожалуйста, используйте кнопки ниже для ответа:",
+        reply_markup=policy_kb()
+    )
 
 
 @router.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer(
+            "ℹ️ Нет активной анкеты для отмены.",
+            reply_markup=main_menu_kb()
+        )
+        return
+    
     await state.clear()
-    await message.answer("Ок. Возвращаю меню.", reply_markup=main_menu_kb())
+    await message.answer(
+        "❌ <b>Заполнение анкеты отменено.</b>\n\n"
+        "Вы можете начать заново, выбрав анкету из меню:",
+        reply_markup=main_menu_kb()
+    )
 
 
 async def start_form(message: Message, state: FSMContext, form_key: str):
     await state.set_state(Flow.filling_form)
     await state.update_data(form_key=form_key, idx=0, answers={})
 
-    title, _ = FORMS[form_key]
-    await message.answer(f"{title}\n\nОтвечайте сообщениями.", reply_markup=ReplyKeyboardRemove())
+    title, questions = FORMS[form_key]
+    
+    form_icons = {
+        "parent_full": "📋",
+        "parent_short": "📝",
+        "child_full": "👦",
+        "child_short": "✏️",
+    }
+    
+    icon = form_icons.get(form_key, "📄")
+    
+    await message.answer(
+        f"{icon} <b>{title}</b>\n\n"
+        f"📝 Всего вопросов: {len(questions)}\n\n"
+        f"Отвечайте на вопросы по порядку.\n"
+        f"Для отмены используйте /cancel\n\n"
+        f"Начинаем! 👇",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
+    await asyncio.sleep(0.5)
     await ask_question_by_index(message, state)
 
 
@@ -416,22 +494,22 @@ async def ask_question_by_index(message: Message, state: FSMContext):
     await message.answer(questions[idx], reply_markup=ReplyKeyboardRemove())
 
 
-@router.message(F.text == "Родительская анкета")
+@router.message(F.text == "📋 Родительская анкета")
 async def menu_parent_full(message: Message, state: FSMContext):
     await start_form(message, state, "parent_full")
 
 
-@router.message(F.text == "Сокращенная родительская")
+@router.message(F.text == "📝 Сокращенная родительская")
 async def menu_parent_short(message: Message, state: FSMContext):
     await start_form(message, state, "parent_short")
 
 
-@router.message(F.text == "Детская анкета")
+@router.message(F.text == "👦 Детская анкета")
 async def menu_child_full(message: Message, state: FSMContext):
     await start_form(message, state, "child_full")
 
 
-@router.message(F.text == "Сокращенная детская")
+@router.message(F.text == "✏️ Сокращенная детская")
 async def menu_child_short(message: Message, state: FSMContext):
     await start_form(message, state, "child_short")
 
@@ -474,14 +552,26 @@ async def finish_form(message: Message, state: FSMContext, sheets: SheetsClient)
 
     headers = make_headers(form_key)
     
+    await message.answer(
+        "⏳ <b>Сохраняю анкету...</b>",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
     try:
         await asyncio.to_thread(sheets.append_row, form_title, headers, row)
         await state.clear()
-        await message.answer("Спасибо! Анкета сохранена.", reply_markup=main_menu_kb())
+        await message.answer(
+            "✅ <b>Отлично! Анкета успешно сохранена!</b>\n\n"
+            "📊 Данные отправлены в Google Sheets\n"
+            "🎉 Спасибо за заполнение!\n\n"
+            "Вы можете заполнить ещё одну анкету или вернуться в меню:",
+            reply_markup=main_menu_kb()
+        )
     except Exception as e:
         print(f"✗ Ошибка при сохранении анкеты: {e}")
         await message.answer(
-            "Произошла ошибка при сохранении анкеты. Пожалуйста, попробуйте позже.",
+            "❌ <b>Произошла ошибка при сохранении анкеты.</b>\n\n"
+            "Пожалуйста, попробуйте позже или обратитесь к администратору.",
             reply_markup=main_menu_kb()
         )
 
@@ -496,12 +586,12 @@ async def admin_broadcast_start(message: Message, state: FSMContext):
 
     await state.set_state(AdminFlow.waiting_broadcast)
     await message.answer(
-        "Отправьте одним сообщением то, что нужно разослать всем пользователям:\n"
-        "— текст\n"
-        "или\n"
-        "— фото с подписью (caption)\n"
-        "или\n"
-        "— фото без подписи",
+        "📢 <b>Режим рассылки</b>\n\n"
+        "Отправьте одним сообщением то, что нужно разослать всем пользователям:\n\n"
+        "• Текст\n"
+        "• Фото с подписью\n"
+        "• Фото без подписи\n\n"
+        "Для отмены используйте /cancel",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -513,8 +603,21 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
 
     user_ids = await all_user_ids()
 
+    if not user_ids:
+        await state.clear()
+        await message.answer(
+            "⚠️ Нет пользователей для рассылки.",
+            reply_markup=main_menu_kb()
+        )
+        return
+
     text = (message.caption or message.text or "").strip()
     photo_id = message.photo[-1].file_id if message.photo else None
+
+    status_msg = await message.answer(
+        f"📤 <b>Начинаю рассылку...</b>\n\n"
+        f"👥 Всего пользователей: {len(user_ids)}"
+    )
 
     sent = 0
     failed = 0
@@ -533,7 +636,12 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
             failed += 1
 
     await state.clear()
-    await message.answer(f"Готово. Отправлено: {sent}. Ошибок: {failed}.", reply_markup=main_menu_kb())
+    await status_msg.edit_text(
+        f"✅ <b>Рассылка завершена!</b>\n\n"
+        f"📨 Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}"
+    )
+    await message.answer("Вернуться в меню:", reply_markup=main_menu_kb())
 
 
 # -----------------------------
