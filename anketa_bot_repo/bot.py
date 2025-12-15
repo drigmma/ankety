@@ -399,7 +399,6 @@ async def cmd_help(message: Message):
         "1. Выберите нужную анкету из меню\n"
         "2. Отвечайте на вопросы по очереди\n"
         "3. Если нужно отменить - используйте /cancel\n"
-        "4. После завершения данные сохранятся в Google Sheets\n\n"
     )
     await message.answer(help_text, reply_markup=main_menu_kb())
 
