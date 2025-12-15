@@ -9,7 +9,7 @@ import gspread
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -361,64 +361,18 @@ router = Router()
 admin_router = Router()
 
 
-# -----------------------------
-# Фильтр: блокировать всё, если согласия нет
-# -----------------------------
-class NeedsPolicy(BaseFilter):
-    async def __call__(self, message: Message, state: FSMContext) -> bool:
-        user = message.from_user
-        if not user:
-            return False
-
-        text = (message.text or "").strip()
-
-        # /start не блокируем
-        if text.startswith("/start"):
-            return False
-
-        # ответы по кнопкам политики не блокируем
-        if text in {POLICY_YES_TEXT, POLICY_NO_TEXT}:
-            return False
-
-        # если мы сейчас ждём ответ по политике — не блокируем
-        if await state.get_state() == Flow.waiting_policy.state:
-            return False
-
-        accepted = await get_policy(user.id)
-        return not accepted
-
-
-@router.message(NeedsPolicy())
-async def block_without_policy(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        "❌ <b>К сожалению, вы не можете продолжить без согласия на обработку персональных данных.</b>\n\n"
-        "Нажмите /start чтобы начать заново.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     user = message.from_user
     await upsert_user(user.id, user.username or "")
 
-    accepted = await get_policy(user.id)
-    if not accepted:
-        await state.set_state(Flow.waiting_policy)
-        await message.answer(
-            "🏕 <b>Добро пожаловать в бот лагеря!</b>\n\n"
-            "📄 Для продолжения работы необходимо согласиться с политикой обработки персональных данных.\n\n"
-            "Согласны ли вы с нашей политикой обработки персональных данных?",
-            reply_markup=policy_kb(),
-        )
-        return
-
-    await state.clear()
+    # Всегда показываем соглашение при /start
+    await state.set_state(Flow.waiting_policy)
     await message.answer(
-        f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
-        "📋 Выберите нужную анкету из меню ниже:",
-        reply_markup=main_menu_kb()
+        "🏕 <b>Добро пожаловать в бот лагеря!</b>\n\n"
+        "📄 Для продолжения работы необходимо согласиться с политикой обработки персональных данных.\n\n"
+        "Согласны ли вы с нашей политикой обработки персональных данных?",
+        reply_markup=policy_kb(),
     )
 
 
