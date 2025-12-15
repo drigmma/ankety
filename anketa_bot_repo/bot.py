@@ -26,7 +26,7 @@ from google.oauth2.service_account import Credentials
 # -----------------------------
 # Конфиг
 # -----------------------------
-load_dotenv()  # подхватит .env в WorkingDirectory; в systemd ещё лучше через EnvironmentFile
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "").strip()
@@ -46,7 +46,7 @@ SCOPES = [
 
 
 # -----------------------------
-# Вопросы анкет (без *)
+# Вопросы анкет
 # -----------------------------
 PARENT_FULL_QUESTIONS: List[str] = [
     "Укажите ваш юзернейм",
@@ -219,27 +219,44 @@ class SheetsClient:
     _sh: Optional[gspread.Spreadsheet] = None
 
     def connect(self) -> None:
-        creds = Credentials.from_service_account_file(self.creds_path, scopes=SCOPES)
-        self._gc = gspread.authorize(creds)
-        self._sh = self._gc.open_by_key(self.sheets_id)
+        try:
+            creds = Credentials.from_service_account_file(self.creds_path, scopes=SCOPES)
+            self._gc = gspread.authorize(creds)
+            self._sh = self._gc.open_by_key(self.sheets_id)
+            print(f"✓ Подключено к Google Sheets: {self._sh.title}")
+        except Exception as e:
+            print(f"✗ Ошибка подключения к Google Sheets: {e}")
+            raise
 
     def ensure_worksheet(self, title: str, headers: List[str]) -> None:
-        assert self._sh is not None
+        if self._sh is None:
+            raise RuntimeError("SheetsClient не подключен")
+        
         try:
             ws = self._sh.worksheet(title)
+            print(f"✓ Лист '{title}' уже существует")
         except gspread.WorksheetNotFound:
             ws = self._sh.add_worksheet(title=title, rows=2000, cols=max(10, len(headers) + 5))
+            print(f"✓ Создан новый лист '{title}'")
 
         current = ws.row_values(1)
         if current != headers:
             ws.clear()
             ws.append_row(headers, value_input_option="USER_ENTERED")
+            print(f"✓ Заголовки обновлены для листа '{title}'")
 
     def append_row(self, title: str, headers: List[str], row: Dict[str, str]) -> None:
-        assert self._sh is not None
-        ws = self._sh.worksheet(title)
-        data = [row.get(h, "") for h in headers]
-        ws.append_row(data, value_input_option="USER_ENTERED")
+        if self._sh is None:
+            raise RuntimeError("SheetsClient не подключен")
+        
+        try:
+            ws = self._sh.worksheet(title)
+            data = [row.get(h, "") for h in headers]
+            ws.append_row(data, value_input_option="USER_ENTERED")
+            print(f"✓ Строка добавлена в лист '{title}'")
+        except Exception as e:
+            print(f"✗ Ошибка при добавлении строки в '{title}': {e}")
+            raise
 
 
 # -----------------------------
@@ -382,7 +399,6 @@ async def start_form(message: Message, state: FSMContext, form_key: str):
     await state.set_state(Flow.filling_form)
     await state.update_data(form_key=form_key, idx=0, answers={})
 
-    # меню скрываем на время анкеты (в т.ч. Да/Нет — без кнопок)
     title, _ = FORMS[form_key]
     await message.answer(f"{title}\n\nОтвечайте сообщениями.", reply_markup=ReplyKeyboardRemove())
     await ask_question_by_index(message, state)
@@ -435,13 +451,11 @@ async def form_answer(message: Message, state: FSMContext, sheets: SheetsClient)
 
     new_idx = idx + 1
 
-    # если анкета закончилась — сохраняем и возвращаем меню
     if new_idx >= len(questions):
         await state.update_data(idx=new_idx, answers=answers)
         await finish_form(message, state, sheets)
         return
 
-    # иначе идём дальше
     await state.update_data(idx=new_idx, answers=answers)
     await ask_question_by_index(message, state)
 
@@ -459,10 +473,17 @@ async def finish_form(message: Message, state: FSMContext, sheets: SheetsClient)
     row.update(answers)
 
     headers = make_headers(form_key)
-    await asyncio.to_thread(sheets.append_row, form_title, headers, row)
-
-    await state.clear()
-    await message.answer("Спасибо! Анкета сохранена.", reply_markup=main_menu_kb())
+    
+    try:
+        await asyncio.to_thread(sheets.append_row, form_title, headers, row)
+        await state.clear()
+        await message.answer("Спасибо! Анкета сохранена.", reply_markup=main_menu_kb())
+    except Exception as e:
+        print(f"✗ Ошибка при сохранении анкеты: {e}")
+        await message.answer(
+            "Произошла ошибка при сохранении анкеты. Пожалуйста, попробуйте позже.",
+            reply_markup=main_menu_kb()
+        )
 
 
 # -----------------------------
@@ -519,7 +540,10 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
 # Startup
 # -----------------------------
 async def on_startup(dispatcher: Dispatcher, bot: Bot):
+    print("=== Запуск бота ===")
+    
     await init_db()
+    print("✓ База данных инициализирована")
 
     sheets = SheetsClient(sheets_id=SHEETS_ID, creds_path=CREDS_PATH)
     sheets.connect()
@@ -528,8 +552,9 @@ async def on_startup(dispatcher: Dispatcher, bot: Bot):
         headers = make_headers(form_key)
         await asyncio.to_thread(sheets.ensure_worksheet, title, headers)
 
-    # ВАЖНО: сохраняем в workflow_data, чтобы aiogram мог инжектить в хендлеры параметр sheets: SheetsClient
     dispatcher.workflow_data["sheets"] = sheets
+    print("✓ Google Sheets настроены")
+    print("=== Бот готов к работе ===\n")
 
 
 async def main():
