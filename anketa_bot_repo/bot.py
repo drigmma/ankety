@@ -9,6 +9,7 @@ import gspread
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import SkipHandler
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -43,6 +44,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+POLICY_YES_TEXT = "✅ Да, согласен"
+POLICY_NO_TEXT = "❌ Нет, не согласен"
 
 
 # -----------------------------
@@ -200,8 +204,8 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
 def policy_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="✅ Да, согласен")],
-            [KeyboardButton(text="❌ Нет, не согласен")],
+            [KeyboardButton(text=POLICY_YES_TEXT)],
+            [KeyboardButton(text=POLICY_NO_TEXT)],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -243,7 +247,7 @@ class SheetsClient:
     def ensure_worksheet(self, title: str, headers: List[str]) -> None:
         if self._sh is None:
             raise RuntimeError("SheetsClient не подключен")
-        
+
         try:
             ws = self._sh.worksheet(title)
             print(f"✓ Лист '{title}' уже существует")
@@ -260,7 +264,7 @@ class SheetsClient:
     def append_row(self, title: str, headers: List[str], row: Dict[str, str]) -> None:
         if self._sh is None:
             raise RuntimeError("SheetsClient не подключен")
-        
+
         try:
             ws = self._sh.worksheet(title)
             data = [row.get(h, "") for h in headers]
@@ -358,6 +362,41 @@ router = Router()
 admin_router = Router()
 
 
+# -----------------------------
+# Гард: если нет согласия — блокируем всё, кроме /start и ответа на политику
+# -----------------------------
+@router.message()
+async def policy_guard(message: Message, state: FSMContext):
+    user = message.from_user
+    await upsert_user(user.id, user.username or "")
+
+    txt = (message.text or "").strip()
+
+    # /start всегда пропускаем
+    if txt.startswith("/start"):
+        raise SkipHandler
+
+    # кнопки политики всегда пропускаем (важно после рестартов, когда FSM может потеряться)
+    if txt in {POLICY_YES_TEXT, POLICY_NO_TEXT}:
+        raise SkipHandler
+
+    # если мы уже в ожидании ответа по политике — пропускаем (пусть обработает policy_answer)
+    current_state = await state.get_state()
+    if current_state == Flow.waiting_policy.state:
+        raise SkipHandler
+
+    accepted = await get_policy(user.id)
+    if accepted:
+        raise SkipHandler
+
+    await state.clear()
+    await message.answer(
+        "❌ <b>К сожалению, вы не можете продолжить без согласия на обработку персональных данных.</b>\n\n"
+        "Нажмите /start и попробуйте начать заново.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     user = message.from_user
@@ -379,6 +418,33 @@ async def cmd_start(message: Message, state: FSMContext):
         f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
         "📋 Выберите нужную анкету из меню ниже:",
         reply_markup=main_menu_kb()
+    )
+
+
+# Дополнительно: обработка кликов по кнопкам политики (даже если FSM слетел)
+@router.message(F.text == POLICY_YES_TEXT)
+async def policy_yes_button(message: Message, state: FSMContext):
+    user = message.from_user
+    await upsert_user(user.id, user.username or "")
+    await set_policy(user.id, True)
+    await state.clear()
+    await message.answer(
+        "✅ <b>Спасибо за согласие!</b>\n\n"
+        "Теперь вы можете заполнять анкеты. Выберите нужную из меню:",
+        reply_markup=main_menu_kb()
+    )
+
+
+@router.message(F.text == POLICY_NO_TEXT)
+async def policy_no_button(message: Message, state: FSMContext):
+    user = message.from_user
+    await upsert_user(user.id, user.username or "")
+    await set_policy(user.id, False)
+    await state.clear()
+    await message.answer(
+        "❌ <b>К сожалению, вы не можете продолжить без согласия на обработку персональных данных.</b>\n\n"
+        "Нажмите /start и попробуйте начать заново.",
+        reply_markup=ReplyKeyboardRemove()
     )
 
 
@@ -420,11 +486,11 @@ async def policy_answer(message: Message, state: FSMContext):
 
     if is_no(message.text):
         await set_policy(user.id, False)
-        await state.set_state(Flow.waiting_policy)
+        await state.clear()
         await message.answer(
-            "❌ <b>Без согласия продолжить работу невозможно.</b>\n\n"
-            "Если передумаете — нажмите кнопку <b>«Да, согласен»</b> или отправьте команду /start",
-            reply_markup=policy_kb()
+            "❌ <b>К сожалению, вы не можете продолжить без согласия на обработку персональных данных.</b>\n\n"
+            "Нажмите /start и попробуйте начать заново.",
+            reply_markup=ReplyKeyboardRemove()
         )
         return
 
@@ -443,7 +509,7 @@ async def cancel(message: Message, state: FSMContext):
             reply_markup=main_menu_kb()
         )
         return
-    
+
     await state.clear()
     await message.answer(
         "❌ <b>Заполнение анкеты отменено.</b>\n\n"
@@ -457,16 +523,16 @@ async def start_form(message: Message, state: FSMContext, form_key: str):
     await state.update_data(form_key=form_key, idx=0, answers={})
 
     title, questions = FORMS[form_key]
-    
+
     form_icons = {
         "parent_full": "📋",
         "parent_short": "📝",
         "child_full": "👦",
         "child_short": "✏️",
     }
-    
+
     icon = form_icons.get(form_key, "📄")
-    
+
     await message.answer(
         f"{icon} <b>{title}</b>\n\n"
         f"Отвечайте на вопросы по порядку.\n"
@@ -474,7 +540,7 @@ async def start_form(message: Message, state: FSMContext, form_key: str):
         f"Начинаем! 👇",
         reply_markup=ReplyKeyboardRemove()
     )
-    
+
     await asyncio.sleep(0.5)
     await ask_question_by_index(message, state)
 
@@ -548,12 +614,12 @@ async def finish_form(message: Message, state: FSMContext, sheets: SheetsClient)
     row.update(answers)
 
     headers = make_headers(form_key)
-    
+
     await message.answer(
         "⏳ <b>Сохраняю анкету...</b>",
         reply_markup=ReplyKeyboardRemove()
     )
-    
+
     try:
         await asyncio.to_thread(sheets.append_row, form_title, headers, row)
         await state.clear()
@@ -645,7 +711,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext, bot: Bot):
 # -----------------------------
 async def on_startup(dispatcher: Dispatcher, bot: Bot):
     print("=== Запуск бота ===")
-    
+
     await init_db()
     print("✓ База данных инициализирована")
 
