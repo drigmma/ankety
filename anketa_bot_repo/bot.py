@@ -9,8 +9,7 @@ import gspread
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import SkipHandler
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -338,12 +337,12 @@ async def all_user_ids() -> List[int]:
 # -----------------------------
 def is_yes(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"да", "yes", "y", "ага", "ок", "okay", "окей", "согласен", "согласна", "✅ да, согласен"}
+    return t in {"да", "yes", "y", "ага", "ок", "okay", "окей", "согласен", "согласна", POLICY_YES_TEXT.lower()}
 
 
 def is_no(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"нет", "no", "n", "не согласен", "не согласна", "❌ нет, не согласен"}
+    return t in {"нет", "no", "n", "не согласен", "не согласна", POLICY_NO_TEXT.lower()}
 
 
 def meta_headers() -> List[str]:
@@ -363,32 +362,34 @@ admin_router = Router()
 
 
 # -----------------------------
-# Гард: если нет согласия — блокируем всё, кроме /start и ответа на политику
+# Фильтр: блокировать всё, если согласия нет (кроме /start и кнопок политики)
 # -----------------------------
-@router.message()
-async def policy_guard(message: Message, state: FSMContext):
-    user = message.from_user
-    await upsert_user(user.id, user.username or "")
+class NeedsPolicy(BaseFilter):
+    async def __call__(self, message: Message, state: FSMContext) -> bool:
+        user = message.from_user
+        if not user:
+            return False
 
-    txt = (message.text or "").strip()
+        text = (message.text or "").strip()
 
-    # /start всегда пропускаем
-    if txt.startswith("/start"):
-        raise SkipHandler
+        # /start не блокируем
+        if text.startswith("/start"):
+            return False
 
-    # кнопки политики всегда пропускаем (важно после рестартов, когда FSM может потеряться)
-    if txt in {POLICY_YES_TEXT, POLICY_NO_TEXT}:
-        raise SkipHandler
+        # ответы по кнопкам политики не блокируем
+        if text in {POLICY_YES_TEXT, POLICY_NO_TEXT}:
+            return False
 
-    # если мы уже в ожидании ответа по политике — пропускаем (пусть обработает policy_answer)
-    current_state = await state.get_state()
-    if current_state == Flow.waiting_policy.state:
-        raise SkipHandler
+        # если мы сейчас ждём ответ по политике — не блокируем (чтобы сработал policy_answer)
+        if await state.get_state() == Flow.waiting_policy.state:
+            return False
 
-    accepted = await get_policy(user.id)
-    if accepted:
-        raise SkipHandler
+        accepted = await get_policy(user.id)
+        return not accepted
 
+
+@router.message(NeedsPolicy())
+async def block_without_policy(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "❌ <b>К сожалению, вы не можете продолжить без согласия на обработку персональных данных.</b>\n\n"
@@ -418,33 +419,6 @@ async def cmd_start(message: Message, state: FSMContext):
         f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
         "📋 Выберите нужную анкету из меню ниже:",
         reply_markup=main_menu_kb()
-    )
-
-
-# Дополнительно: обработка кликов по кнопкам политики (даже если FSM слетел)
-@router.message(F.text == POLICY_YES_TEXT)
-async def policy_yes_button(message: Message, state: FSMContext):
-    user = message.from_user
-    await upsert_user(user.id, user.username or "")
-    await set_policy(user.id, True)
-    await state.clear()
-    await message.answer(
-        "✅ <b>Спасибо за согласие!</b>\n\n"
-        "Теперь вы можете заполнять анкеты. Выберите нужную из меню:",
-        reply_markup=main_menu_kb()
-    )
-
-
-@router.message(F.text == POLICY_NO_TEXT)
-async def policy_no_button(message: Message, state: FSMContext):
-    user = message.from_user
-    await upsert_user(user.id, user.username or "")
-    await set_policy(user.id, False)
-    await state.clear()
-    await message.answer(
-        "❌ <b>К сожалению, вы не можете продолжить без согласия на обработку персональных данных.</b>\n\n"
-        "Нажмите /start и попробуйте начать заново.",
-        reply_markup=ReplyKeyboardRemove()
     )
 
 
@@ -522,7 +496,7 @@ async def start_form(message: Message, state: FSMContext, form_key: str):
     await state.set_state(Flow.filling_form)
     await state.update_data(form_key=form_key, idx=0, answers={})
 
-    title, questions = FORMS[form_key]
+    title, _questions = FORMS[form_key]
 
     form_icons = {
         "parent_full": "📋",
